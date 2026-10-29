@@ -142,27 +142,7 @@ jobs:
             git branch -f "$QUARANTINE_BRANCH" upstream/"$DEFAULT_BRANCH"
             git push origin "$QUARANTINE_BRANCH" || true
 
-            ISSUE_BODY=$(cat <<EOF
-### 🚨 上游同步安全熔断触发
-
-系统检测到上游可能发生了 **删库跑路、清空核心代码、删除核心包或恶意精简**。
-为保护你的 Fork，自动同步已被紧急拦截，\`$DEFAULT_BRANCH\` 分支代码未受任何影响。
-
-#### 异常详情:
-$REASONS
-
-#### 统计数据:
-- 本地文件数: $LOCAL_FILES_COUNT (有效文件: $LOCAL_CODE_FILES)
-- 上游文件数: $UPSTREAM_FILES_COUNT (有效文件: $UPSTREAM_CODE_FILES)
-- 本地体积: $LOCAL_TOTAL_SIZE bytes / 上游体积: $UPSTREAM_TOTAL_SIZE bytes
-- 变动统计: \`$DIFF_STAT\`
-- 已将上游提交备份至隔离分支: \`$QUARANTINE_BRANCH\`
-
-#### 如何处理:
-1. 在仓库查看隔离分支。若上游确系正常重大重构，可在 GitHub Actions 页面手动运行工作流并勾选 **「force_sync」** 强制合并。
-2. 若上游确系删库或清空，当前 Fork 即为你保存的完整孤本，无需做任何处理。
-EOF
-)
+            ISSUE_BODY="### 🚨 上游同步安全熔断触发\n\n系统检测到上游可能发生了 **删库跑路、清空核心代码、删除核心包或恶意精简**。\n为保护你的 Fork，自动同步已被紧急拦截，`$DEFAULT_BRANCH` 分支代码未受任何影响。\n\n#### 异常详情:\n$REASONS\n\n#### 统计数据:\n- 本地文件数: $LOCAL_FILES_COUNT (有效文件: $LOCAL_CODE_FILES)\n- 上游文件数: $UPSTREAM_FILES_COUNT (有效文件: $UPSTREAM_CODE_FILES)\n- 本地体积: $LOCAL_TOTAL_SIZE bytes / 上游体积: $UPSTREAM_TOTAL_SIZE bytes\n- 变动统计: `$DIFF_STAT`\n- 已将上游提交备份至隔离分支: `$QUARANTINE_BRANCH`\n\n#### 如何处理:\n1. 在仓库查看隔离分支。若上游确系正常重大重构，可在 GitHub Actions 页面手动运行工作流并勾选 **「force_sync」** 强制合并。\n2. 若上游确系删库或清空，当前 Fork 即为你保存的完整孤本，无需做任何处理。"
             gh issue create \
               --title "🚨 [熔断拦截] 检测到上游异常删除代码/核心资产，已阻止同步" \
               --body "$ISSUE_BODY" || true
