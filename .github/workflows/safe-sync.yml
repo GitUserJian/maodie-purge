@@ -38,12 +38,13 @@ jobs:
           set -e
 
           # 1. 获取上游仓库地址
-          UPSTREAM_URL=$(gh repo view --json parent -q '.parent.url')
-          if [ -z "$UPSTREAM_URL" ] || [ "$UPSTREAM_URL" = "null" ]; then
+          PARENT_OWNER=$(gh repo view --json parent -q '.parent.owner.login // empty')
+          PARENT_NAME=$(gh repo view --json parent -q '.parent.name // empty')
+          if [ -z "$PARENT_OWNER" ] || [ -z "$PARENT_NAME" ]; then
             echo "::error::未找到上游 parent 仓库，当前可能不是 Fork 仓库！"
             exit 1
           fi
-
+          UPSTREAM_URL="https://github.com/${PARENT_OWNER}/${PARENT_NAME}.git"
           DEFAULT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
           echo "当前分支: $DEFAULT_BRANCH"
           echo "上游仓库: $UPSTREAM_URL"
