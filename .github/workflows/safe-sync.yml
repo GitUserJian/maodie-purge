@@ -1,0 +1,177 @@
+name: Safe Upstream Sync (带防删库与核心代码熔断保护)
+
+on:
+  schedule:
+    # 每天 UTC 0:00 和 12:00 定时执行
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: '是否强制同步 (忽略安全熔断检查)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出本地 Fork 仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 配置 Git 信息
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 探测上游并执行熔断安全检查
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_SYNC: ${{ inputs.force_sync }}
+        run: |
+          set -e
+
+          # 1. 获取上游仓库地址
+          UPSTREAM_URL=$(gh repo view --json parent -q '.parent.url')
+          if [ -z "$UPSTREAM_URL" ] || [ "$UPSTREAM_URL" = "null" ]; then
+            echo "::error::未找到上游 parent 仓库，当前可能不是 Fork 仓库！"
+            exit 1
+          fi
+
+          DEFAULT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          echo "当前分支: $DEFAULT_BRANCH"
+          echo "上游仓库: $UPSTREAM_URL"
+
+          git remote add upstream "$UPSTREAM_URL" || git remote set-url upstream "$UPSTREAM_URL"
+
+          # 2. 检查上游连通性 (防删库/转私有/404)
+          echo "正在连接上游分支..."
+          if ! git fetch upstream "$DEFAULT_BRANCH"; then
+            echo "::error::无法连接上游分支，上游可能已删库、转私有或分支更名！"
+            gh issue create \
+              --title "🚨 [熔断拦截] 上游仓库无法连接 (可能已删库/封禁/转私有)" \
+              --body "自动化同步在拉取上游 ($UPSTREAM_URL) 时失败。上游可能已被作者删除或转为私有。当前 Fork 代码已被安全锁定保护，未做任何修改。" \
+              || true
+            exit 1
+          fi
+
+          # 3. 检查是否有新提交
+          MERGE_BASE=$(git merge-base HEAD upstream/"$DEFAULT_BRANCH" || true)
+          UPSTREAM_HASH=$(git rev-parse upstream/"$DEFAULT_BRANCH")
+
+          if [ "$MERGE_BASE" = "$UPSTREAM_HASH" ]; then
+            echo "上游无新提交，当前分支已包含上游所有内容，无需同步。"
+            exit 0
+          fi
+
+          echo "发现上游新提交: $UPSTREAM_HASH (Merge Base: $MERGE_BASE)"
+
+          # 4. 指标统计与异常熔断特征分析
+          LOCAL_FILES_COUNT=$(git ls-tree -r --name-only HEAD | wc -l)
+          UPSTREAM_FILES_COUNT=$(git ls-tree -r --name-only upstream/"$DEFAULT_BRANCH" | wc -l)
+
+          # 上游有效非文档非配置代码/资源文件数
+          UPSTREAM_CODE_FILES=$(git ls-tree -r --name-only upstream/"$DEFAULT_BRANCH" | grep -v -i -E '^(readme|license|contributing|\.github|\.gitignore)' | wc -l || true)
+          LOCAL_CODE_FILES=$(git ls-tree -r --name-only HEAD | grep -v -i -E '^(readme|license|contributing|\.github|\.gitignore)' | wc -l || true)
+
+          # 仓库总跟踪体积对比 (防删大核心文件/压缩包/清空代码)
+          LOCAL_TOTAL_SIZE=$(git ls-tree -r -l HEAD | awk '{sum+=$4} END {print sum+0}')
+          UPSTREAM_TOTAL_SIZE=$(git ls-tree -r -l upstream/"$DEFAULT_BRANCH" | awk '{sum+=$4} END {print sum+0}')
+
+          DIFF_STAT=$(git diff --shortstat "$MERGE_BASE"..upstream/"$DEFAULT_BRANCH" || true)
+          DELETED_FILES=$(git diff --name-only --diff-filter=D "$MERGE_BASE"..upstream/"$DEFAULT_BRANCH" || true)
+
+          echo "=== 上游更新安全分析报告 ==="
+          echo "本地跟踪文件数: $LOCAL_FILES_COUNT (有效代码/资产文件: $LOCAL_CODE_FILES)"
+          echo "上游跟踪文件数: $UPSTREAM_FILES_COUNT (有效代码/资产文件: $UPSTREAM_CODE_FILES)"
+          echo "本地跟踪总大小: $LOCAL_TOTAL_SIZE bytes"
+          echo "上游跟踪总大小: $UPSTREAM_TOTAL_SIZE bytes"
+          echo "差异统计: $DIFF_STAT"
+          echo "删除文件列表: $DELETED_FILES"
+          echo "============================"
+
+          ABNORMAL=false
+          REASONS=""
+
+          # 规则 1: 上游被清空/只剩 README 或文档 (极高频跑路特征)
+          if [ "$LOCAL_CODE_FILES" -gt 0 ] && [ "$UPSTREAM_CODE_FILES" -eq 0 ]; then
+            ABNORMAL=true
+            REASONS="${REASONS}\n- ⚠️ **空壳跑路风险**: 上游所有核心代码/压缩包均被清空，目前几乎只剩 README 或文档！"
+          fi
+
+          # 规则 2: 文件数断崖式暴跌 (减少超过 40%)
+          if [ "$LOCAL_FILES_COUNT" -ge 4 ]; then
+            DROP_RATIO=$(( (LOCAL_FILES_COUNT - UPSTREAM_FILES_COUNT) * 100 / LOCAL_FILES_COUNT ))
+            if [ "$DROP_RATIO" -ge 40 ]; then
+              ABNORMAL=true
+              REASONS="${REASONS}\n- ⚠️ **文件大量删除风险**: 文件总数由 $LOCAL_FILES_COUNT 锐减到 $UPSTREAM_FILES_COUNT (暴跌 ${DROP_RATIO}%)！"
+            fi
+          fi
+
+          # 规则 3: 仓库总体积断崖式缩水超过 50% (防删除核心大文件/核心包)
+          if [ "$LOCAL_TOTAL_SIZE" -gt 10240 ]; then
+            SIZE_DROP_RATIO=$(( (LOCAL_TOTAL_SIZE - UPSTREAM_TOTAL_SIZE) * 100 / LOCAL_TOTAL_SIZE ))
+            if [ "$SIZE_DROP_RATIO" -ge 50 ]; then
+              ABNORMAL=true
+              REASONS="${REASONS}\n- ⚠️ **体积大幅缩水风险**: 仓库总大小从 $LOCAL_TOTAL_SIZE 字节缩减至 $UPSTREAM_TOTAL_SIZE 字节 (缩减 ${SIZE_DROP_RATIO}%)！"
+            fi
+          fi
+
+          # 规则 4: 常见核心代码目录整盘消失
+          for CORE_DIR in "src" "lib" "app" "core" "packages" "api" "skills" "prompts"; do
+            if git ls-tree -d HEAD "$CORE_DIR" >/dev/null 2>&1; then
+              if ! git ls-tree -d upstream/"$DEFAULT_BRANCH" "$CORE_DIR" >/dev/null 2>&1; then
+                ABNORMAL=true
+                REASONS="${REASONS}\n- ⚠️ **核心目录丢失风险**: 本地存在的 \`$CORE_DIR/\` 目录在上游已被彻底删除！"
+              fi
+            fi
+          done
+
+          # 5. 熔断判定与拦截
+          if [ "$ABNORMAL" = true ] && [ "$FORCE_SYNC" != "true" ]; then
+            echo "::error::触发安全熔断保护，上游变更已被拦截，放弃合并！"
+
+            # 将上游可疑更新保存到隔离分支供人工审查
+            QUARANTINE_BRANCH="quarantine/upstream-$(date +%Y%m%d-%H%M%S)"
+            git branch -f "$QUARANTINE_BRANCH" upstream/"$DEFAULT_BRANCH"
+            git push origin "$QUARANTINE_BRANCH" || true
+
+            ISSUE_BODY=$(cat <<EOF
+### 🚨 上游同步安全熔断触发
+
+系统检测到上游可能发生了 **删库跑路、清空核心代码、删除核心包或恶意精简**。
+为保护你的 Fork，自动同步已被紧急拦截，\`$DEFAULT_BRANCH\` 分支代码未受任何影响。
+
+#### 异常详情:
+$REASONS
+
+#### 统计数据:
+- 本地文件数: $LOCAL_FILES_COUNT (有效文件: $LOCAL_CODE_FILES)
+- 上游文件数: $UPSTREAM_FILES_COUNT (有效文件: $UPSTREAM_CODE_FILES)
+- 本地体积: $LOCAL_TOTAL_SIZE bytes / 上游体积: $UPSTREAM_TOTAL_SIZE bytes
+- 变动统计: \`$DIFF_STAT\`
+- 已将上游提交备份至隔离分支: \`$QUARANTINE_BRANCH\`
+
+#### 如何处理:
+1. 在仓库查看隔离分支。若上游确系正常重大重构，可在 GitHub Actions 页面手动运行工作流并勾选 **「force_sync」** 强制合并。
+2. 若上游确系删库或清空，当前 Fork 即为你保存的完整孤本，无需做任何处理。
+EOF
+)
+            gh issue create \
+              --title "🚨 [熔断拦截] 检测到上游异常删除代码/核心资产，已阻止同步" \
+              --body "$ISSUE_BODY" || true
+
+            exit 1
+          fi
+
+          # 6. 安全检查通过，执行合并
+          echo "安全检查通过，正在执行合并..."
+          git merge upstream/"$DEFAULT_BRANCH" --no-edit -m "chore(sync): safe sync from upstream ($UPSTREAM_HASH)"
+          git push origin "$DEFAULT_BRANCH"
+          echo "🎉 同步成功！"
